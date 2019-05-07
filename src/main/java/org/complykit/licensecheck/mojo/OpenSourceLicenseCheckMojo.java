@@ -30,6 +30,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -71,6 +73,62 @@ public class OpenSourceLicenseCheckMojo extends AbstractMojo
 {
 
   private static final Locale LOCALE = Locale.ENGLISH;
+
+  private enum CheckOutcome
+  {
+    LICENSE_INVALID_NO_INFO( 0, "INVALID (no license info)" ),
+    ARTIFACT_EXCLUDED( 1, "ARTIFACT_EXCLUDED" ),
+    LICENSE_INVALID_BLACKLISTED( 2, "INVALID (blacklisted)" ),
+    LICENSE_INVALID_NOT_RECOGNIZED( 3, "INVALID (not recognized)" ),
+    LICENSE_VALID( 4, "VALID" );
+
+    public final int displayOrder;
+    public final String displayName;
+
+    CheckOutcome(int displayOrder, String displayName)
+    {
+      this.displayOrder = displayOrder;
+      this.displayName = displayName;
+    }
+  }
+
+  private static final class CheckResult implements Comparable<CheckResult>
+  {
+    public final CheckOutcome outcome;
+    public final Artifact artifact;
+    public final String licenseCode;
+
+    private CheckResult(Artifact artifact, CheckOutcome status) {
+      this(artifact,null,status);
+    }
+
+    private CheckResult(Artifact artifact,String licenseCode, CheckOutcome status)
+    {
+      this.artifact = artifact;
+      this.licenseCode = licenseCode;
+      this.outcome = status;
+    }
+
+    public boolean hasStatus(CheckOutcome status) {
+      return this.outcome == status;
+    }
+
+    public boolean hasUnknownLicense() {
+      return hasStatus( CheckOutcome.LICENSE_INVALID_NO_INFO );
+    }
+
+    @Override
+    public int compareTo(CheckResult o)
+    {
+      if ( hasUnknownLicense() == o.hasUnknownLicense() ) {
+        return 0;
+      }
+      if ( hasUnknownLicense() ) {
+        return 1;
+      }
+      return -1;
+    }
+  }
 
   /**
    * This is the repo system required by Aether
@@ -169,11 +227,13 @@ public class OpenSourceLicenseCheckMojo extends AbstractMojo
     final Set<Artifact> artifacts = project.getDependencyArtifacts();
     getLog().info("Validating licenses for " + artifacts.size() + " artifact(s)");
 
-    final Map<String, String> licenses = new HashMap<String, String>();
+    final Map<String, CheckResult> licenses = new HashMap<String, CheckResult>();
 
     boolean buildFails = false;
-    for (final Artifact artifact : artifacts) {
-      if (!artifactIsOnExcludeList(excludeSet, excludePatternList, excludedScopesSet, artifact)) {
+    for (final Artifact artifact : artifacts)
+    {
+      if (!artifactIsOnExcludeList(excludeSet, excludePatternList, excludedScopesSet, artifact))
+      {
         final ArtifactRequest request = new ArtifactRequest();
         request.setArtifact(RepositoryUtils.toArtifact(artifact));
         request.setRepositories(remoteRepos);
@@ -182,34 +242,41 @@ public class OpenSourceLicenseCheckMojo extends AbstractMojo
         try {
           result = repoSystem.resolveArtifact(repoSession, request);
           getLog().info(result.toString());
-        } catch (final ArtifactResolutionException e) {
-          // TODO: figure out how to deal with this one
+        }
+        catch (final ArtifactResolutionException e)
+        {
+            throw new MojoExecutionException( e.getMessage(), e );
         }
 
         String licenseName = "";
+        final CheckOutcome outcome;
         try {
           licenseName = recurseForLicenseName(RepositoryUtils.toArtifact(result.getArtifact()), 0);
         } catch (IOException e) {
           getLog().error("Error reading license information", e);
         }
-        String code = convertLicenseNameToCode(licenseName);
-        if (code == null) {
-          if (excludeNoLicense==false) {
+        String licenseCode = convertLicenseNameToCode(licenseName);
+        if (licenseCode == null) {
+          outcome = CheckOutcome.LICENSE_INVALID_NO_INFO;
+          if (! excludeNoLicense) {
             buildFails = true;
             getLog().warn("Build will fail because of artifact '" + toCoordinates(artifact) + "' and license'" + licenseName + "'.");
           }
-        } else if (blacklistSet.isEmpty() == false && isContained(blacklistSet, code)) {
+        } else if ( !blacklistSet.isEmpty() && isContained(blacklistSet, licenseCode)) {
+          outcome = CheckOutcome.LICENSE_INVALID_BLACKLISTED;
           buildFails = true;
-          code += " IS ON YOUR BLACKLIST";
-        } else if (whitelistSet.isEmpty() == false && isContained(whitelistSet, code) == false) {
+          licenseCode += " IS ON YOUR BLACKLIST";
+        } else if ( !whitelistSet.isEmpty() && ! isContained(whitelistSet, licenseCode) ) {
+          outcome = CheckOutcome.LICENSE_INVALID_NOT_RECOGNIZED;
           buildFails = true;
-          code += " IS NOT ON YOUR WHITELIST";
+          licenseCode += " IS NOT ON YOUR WHITELIST";
+        } else {
+          outcome = CheckOutcome.LICENSE_VALID;
         }
-        licenses.put(artifact.getArtifactId(), code);
+        licenses.put(toCoordinates(artifact), new CheckResult(artifact,licenseCode,outcome));
       } else {
-        licenses.put(artifact.getArtifactId(), "SKIPPED because artifact is on your exclude list");
+        licenses.put(toCoordinates(artifact), new CheckResult(artifact, CheckOutcome.ARTIFACT_EXCLUDED) );
       }
-
     }
 
     getLog().info("");
@@ -222,10 +289,26 @@ public class OpenSourceLicenseCheckMojo extends AbstractMojo
     getLog().info("This plugin and its author are not associated with the OSI.");
     getLog().info("Please send me feedback: me@michaelrice.com. Thanks!");
     getLog().info("");
-    final Set<String> keys = licenses.keySet();
+
     getLog().info("--[ Licenses found ]------ ");
-    for (final String artifact : keys) {
-      getLog().info("\t" + artifact + ": " + licenses.get(artifact));
+
+    final List<CheckResult> sorted = new ArrayList<>( licenses.values() );
+    Collections.sort( sorted , new Comparator<CheckResult>()
+    {
+      @Override
+      public int compare(CheckResult o1, CheckResult o2)
+      {
+        return Integer.compare(o1.outcome.displayOrder,o2.outcome.displayOrder);
+      }
+    } );
+
+    for (final CheckResult result : sorted)
+    {
+      final String lic = result.licenseCode == null ? "n/a" : result.licenseCode;
+      final String licPart = " [ " + leftPad(lic,10 )+ " ]";
+      final String statusPart = rightPad(result.outcome.displayName, 25 );
+      final String combined = statusPart + " "+licPart;
+      getLog().info( "LICENSE: " + combined +" "+result.artifact );
     }
 
     if (buildFails) {
@@ -237,7 +320,22 @@ public class OpenSourceLicenseCheckMojo extends AbstractMojo
     getLog().info("");
     getLog().info("RESULT: license check complete, no issues found.");
     getLog().info("");
+  }
 
+  private static String rightPad(String input,int len)
+  {
+    while ( input.length() < len ) {
+      input += " ";
+    }
+    return input;
+  }
+
+  private static String leftPad(String input,int len)
+  {
+    while ( input.length() < len ) {
+      input = " "+input;
+    }
+    return input;
   }
 
   Set<String> getAsLowerCaseSet(final String[] src)
